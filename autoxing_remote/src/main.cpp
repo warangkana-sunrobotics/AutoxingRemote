@@ -5,6 +5,9 @@
 #include <IRremote.hpp>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
 #include <string.h>
 #include <vector>
 
@@ -72,6 +75,54 @@ const int IR_RECEIVE_PIN = 15;
 #define CODE_7        0xF807FF00
 #define CODE_8        0xEA15FF00
 #define CODE_9        0xF609FF00
+
+// --- ขาของบอร์ด AutoXing Remote PCB rev 1.0 (ดู AutoxingRemote_schematic_full.pdf) ---
+const int PIN_I2C_SDA = 21;     // LCD SDA ผ่าน level shifter Q1
+const int PIN_I2C_SCL = 22;     // LCD SCL ผ่าน level shifter Q2
+const int PIN_JOY_X = 34;       // Joystick VRX (ADC1)
+const int PIN_JOY_Y = 35;       // Joystick VRY (ADC1)
+const int PIN_JOY_SW = 39;      // Joystick SW, active LOW, pull-up R3 บนบอร์ด
+const int PIN_LED_GREEN = 19;   // D1
+const int PIN_LED_RED = 18;     // D2
+const int PIN_VBAT = 36;        // VBAT/2 จาก R1/R2 (ADC1)
+
+// --- Keypad 4x4: R1-R4 = IO32,33,25,26 / C1-C4 = IO27,14,13,4 ---
+const byte KEYPAD_ROWS = 4;
+const byte KEYPAD_COLS = 4;
+char keypadKeys[KEYPAD_ROWS][KEYPAD_COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'},
+};
+byte keypadRowPins[KEYPAD_ROWS] = {32, 33, 25, 26};
+byte keypadColPins[KEYPAD_COLS] = {27, 14, 13, 4};
+Keypad keypad = Keypad(makeKeymap(keypadKeys), keypadRowPins, keypadColPins, KEYPAD_ROWS, KEYPAD_COLS);
+
+// --- LCD 1602 I2C (backpack PCF8574 ที่ 0x27 หรือ 0x3F ตรวจหาเองตอนบูต) ---
+LiquidCrystal_I2C* lcd = nullptr;
+String lcdLines[2];
+String lcdMessage = "";
+unsigned long lcdMessageUntil = 0;
+
+// --- Joystick ---
+const int JOY_DEADZONE = 350;             // ADC counts (เต็มสเกล 4095)
+const bool JOY_INVERT_X = false;          // กลับทิศถ้าโยกขวาแล้วหุ่นเลี้ยวซ้าย
+const bool JOY_INVERT_Y = true;           // กลับทิศถ้าดันขึ้นแล้วหุ่นถอยหลัง
+int joyCenterX = 2048;
+int joyCenterY = 2048;
+bool joystickActive = false;              // กำลังขับด้วย joystick อยู่
+bool joystickWaitCenter = false;          // หลัง STOP ต้องปล่อยคันโยกกลับกลางก่อนถึงจะขับต่อได้
+unsigned long lastJoyModeAttempt = 0;
+
+// --- Battery / LED ---
+float batteryVoltage = 0.0f;
+const float BATTERY_LOW_VOLTAGE = 3.40f;
+unsigned long stopFlashUntil = 0;
+String currentTargetName = "";
+
+void showMessage(const String& text, unsigned long durationMs = 2000);
+void emergencyStop();
 
 // --- ตัวแปรจัดการสถานะ ---
 String inputBuffer = "";                      // บัฟเฟอร์เก็บตัวเลขที่พิมพ์
@@ -276,6 +327,9 @@ bool sendRobotMoveCommand(const PointTarget& target) {
     controlMode = MODE_NAVIGATION;
     navigationActive = true;
     inputBuffer = "";
+    currentTargetName = target.name;
+  } else {
+    showMessage("Move failed " + String(response));
   }
   http.end();
   return response >= 200 && response < 300;
@@ -426,6 +480,38 @@ void checkWifiConnection() {
 
 
 
+// --- หยุดฉุกเฉิน: ใช้ร่วมกันระหว่าง OK 2 ครั้ง (IR / ปุ่ม #), ปุ่ม D และปุ่มกด joystick ---
+
+void emergencyStop() {
+  Serial.println(">> EMERGENCY STOP: clearing queued moves");
+  navigationQueue.clear();
+  inputBuffer = "";
+  // Prevent the held-direction resend loop and the joystick from issuing another
+  // velocity command after the emergency stop request.
+  lastDirectionCode = 0;
+  lastDirectionSignalTime = 0;
+  joystickActive = false;
+  joystickWaitCenter = true;
+  stopFlashUntil = millis() + 1500;
+  if (navigationActive || controlMode == MODE_NAVIGATION) {
+    if (cancelCurrentNavigation()) {
+      navigationActive = false;
+      setRobotControlMode("auto");
+      controlMode = MODE_IDLE;
+      Serial.println("[NAV] Current move cancelled; queue cleared; manual unlocked");
+      showMessage("STOP: nav cancel");
+    } else {
+      Serial.println("[NAV] Cancel not confirmed; queue cleared, manual remains locked");
+      showMessage("STOP: not confirm");
+    }
+  } else {
+    if (controlMode == MODE_MANUAL) sendRobotStopCommand();
+    showMessage("STOP");
+  }
+}
+
+
+
 // --- ฟังก์ชันประมวลผลการกดปุ่ม OK ---
 
 void handleOkButton() {
@@ -438,27 +524,8 @@ void handleOkButton() {
 
   if (lastOkTime != 0 && currentTime - lastOkTime < DOUBLE_CLICK_TIME) {
 
-    Serial.println(">> EMERGENCY STOP: Double OK detected; clearing queued moves");
-    navigationQueue.clear();
-    inputBuffer = "";
-    // Prevent the held-direction resend loop from issuing another velocity
-    // command after the emergency stop request.
-    lastDirectionCode = 0;
-    lastDirectionSignalTime = 0;
-    if (navigationActive || controlMode == MODE_NAVIGATION) {
-      if (cancelCurrentNavigation()) {
-        navigationActive = false;
-        setRobotControlMode("auto");
-        controlMode = MODE_IDLE;
-        Serial.println("[NAV] Current move cancelled; queue cleared; manual unlocked");
-      } else {
-        Serial.println("[NAV] Cancel not confirmed; queue cleared, manual remains locked");
-      }
-    } else if (controlMode == MODE_MANUAL) {
-      sendRobotStopCommand();
-    }
-
-    inputBuffer = ""; // ล้างบัฟเฟอร์
+    Serial.println(">> EMERGENCY STOP: Double OK detected");
+    emergencyStop();
 
     lastOkTime = 0;
 
@@ -487,10 +554,12 @@ void handleOkButton() {
     if (target != nullptr) {
       if (navigationQueue.size() >= MAX_NAVIGATION_QUEUE) {
         Serial.println("[QUEUE] Queue full; maximum is 20 destinations");
+        showMessage("Queue full (20)");
       } else {
         navigationQueue.push_back(*target);
         Serial.printf("[QUEUE] Added %s; %u destination(s) queued\n",
                       target->name.c_str(), (unsigned)navigationQueue.size());
+        showMessage("Queued " + target->name);
         lastOkTime = 0;  // Selecting a target is not the first emergency-stop click.
         if (!navigationActive) startNextQueuedMove();
       }
@@ -498,6 +567,7 @@ void handleOkButton() {
       lastOkTime = 0;
     } else {
       Serial.printf("[NAV] Target '%s' was not loaded from the current map\n", targetName.c_str());
+      showMessage("No point " + targetName);
     }
 
     inputBuffer = ""; // ล้างบัฟเฟอร์ตัวเลขหลังจากกด OK เคลื่อนที่แล้ว
@@ -508,9 +578,248 @@ void handleOkButton() {
 
 
 
+// --- ป้อนตัวเลขจุดหมาย (ใช้ร่วมกันระหว่างรีโมต IR และ keypad) ---
+
+void prepareForDigitEntry() {
+  // Number keys may append destinations while a move is running.
+  // They only stop manual mode; they never cancel active navigation.
+  if (!navigationActive && controlMode == MODE_MANUAL) sendRobotStopCommand();
+  if (!navigationActive && controlMode == MODE_NAVIGATION) {
+    setRobotControlMode("auto");
+    controlMode = MODE_IDLE;
+  }
+  lastDirectionCode = 0;
+  joystickActive = false;
+}
+
+void appendDigit(char digit) {
+  if (inputBuffer.length() >= 8) return;  // ชื่อจุดยาวสุด 8 หลัก (พอดีจอ LCD)
+  inputBuffer += digit;
+  Serial.println("Buffer: " + inputBuffer);
+}
+
+
+
+// --- Keypad 4x4 ---
+// 0-9 = ใส่หมายเลขจุด | # = OK (กด 2 ครั้งเร็ว = STOP) | * = ลบตัวท้าย
+// A = เพิ่มความเร็ว | B = ลดความเร็ว | C = ล้างตัวเลข | D = STOP ทันที
+
+void handleKeypad() {
+  char key = keypad.getKey();
+  if (!key) return;
+  Serial.printf("[KEYPAD] %c\n", key);
+  if (key >= '0' && key <= '9') {
+    prepareForDigitEntry();
+    appendDigit(key);
+    return;
+  }
+  switch (key) {
+    case '#': handleOkButton(); break;
+    case '*':
+      if (inputBuffer.length() > 0) inputBuffer.remove(inputBuffer.length() - 1);
+      break;
+    case 'A': changeManualSpeed(SPEED_STEP); showMessage("Speed " + String(manualSpeed, 2) + " m/s"); break;
+    case 'B': changeManualSpeed(-SPEED_STEP); showMessage("Speed " + String(manualSpeed, 2) + " m/s"); break;
+    case 'C': inputBuffer = ""; break;
+    case 'D': emergencyStop(); break;
+    default: break;
+  }
+}
+
+
+
+// --- Joystick: ขับแบบ proportional ด้วย /twist, กดปุ่มที่คันโยก = STOP ---
+
+void calibrateJoystick() {
+  long sumX = 0, sumY = 0;
+  for (int i = 0; i < 32; ++i) {
+    sumX += analogRead(PIN_JOY_X);
+    sumY += analogRead(PIN_JOY_Y);
+    delay(2);
+  }
+  joyCenterX = sumX / 32;
+  joyCenterY = sumY / 32;
+  Serial.printf("[JOY] Center X=%d Y=%d\n", joyCenterX, joyCenterY);
+}
+
+// คืนค่า -1..1 จากค่า ADC โดยตัด deadzone รอบจุดกลาง
+float joystickAxis(int raw, int center) {
+  int delta = raw - center;
+  if (abs(delta) < JOY_DEADZONE) return 0.0f;
+  float span = delta > 0 ? (4095 - center - JOY_DEADZONE) : (center - JOY_DEADZONE);
+  if (span < 1) return 0.0f;
+  float value = (delta > 0 ? delta - JOY_DEADZONE : delta + JOY_DEADZONE) / span;
+  return constrain(value, -1.0f, 1.0f);
+}
+
+void handleJoystick() {
+  static unsigned long lastRead = 0;
+  static uint8_t lowCount = 0;
+  static bool buttonHeld = false;
+  if (millis() - lastRead < 50) return;
+  lastRead = millis();
+
+  // GPIO39 อาจมี glitch สั้น ๆ ตอน WiFi/ADC ทำงาน จึงต้องอ่าน LOW ติดกัน 2 ครั้งก่อน
+  if (digitalRead(PIN_JOY_SW) == LOW) {
+    if (lowCount < 2) ++lowCount;
+  } else {
+    lowCount = 0;
+    buttonHeld = false;
+  }
+  if (lowCount >= 2 && !buttonHeld) {
+    buttonHeld = true;
+    Serial.println("[JOY] Button -> STOP");
+    emergencyStop();
+    return;
+  }
+
+  float x = joystickAxis(analogRead(PIN_JOY_X), joyCenterX);
+  float y = joystickAxis(analogRead(PIN_JOY_Y), joyCenterY);
+  if (JOY_INVERT_X) x = -x;
+  if (JOY_INVERT_Y) y = -y;
+  bool deflected = x != 0.0f || y != 0.0f;
+
+  if (!deflected) {
+    joystickWaitCenter = false;
+    if (joystickActive) {
+      Serial.println("[JOY] Released -> STOP");
+      sendRobotStopCommand();
+      joystickActive = false;
+    }
+    return;
+  }
+  // รีโมต IR กำลังสั่งอยู่ หรือเพิ่งกด STOP แล้วยังไม่ปล่อยคันโยกกลับกลาง
+  if (joystickWaitCenter || lastDirectionCode != 0) return;
+
+  if (!joystickActive) {
+    if (millis() - lastJoyModeAttempt < 1000) return;  // อย่ายิง HTTP ถี่ ๆ ถ้าล้มเหลว
+    lastJoyModeAttempt = millis();
+    if (!enterManualMode()) {
+      showMessage(navigationActive ? "Nav running" : "Manual failed");
+      return;
+    }
+    joystickActive = true;
+  }
+  // รอ feedback จากหุ่นก่อนส่งค่าใหม่ (เหมือนปุ่มทิศทาง IR) แต่ไม่รอเกิน 500 ms
+  bool ready = twistFeedbackReceived || millis() - lastTwistSendTime > 500;
+  if (webSocketConnected && ready && millis() - lastTwistSendTime >= TWIST_SEND_INTERVAL) {
+    sendManualControl(y * manualSpeed, -x * TURN_SPEED);
+  }
+}
+
+
+
+// --- แบตเตอรี่: VBAT/2 ที่ IO36 ---
+
+void updateBattery() {
+  static unsigned long lastRead = 0;
+  if (lastRead != 0 && millis() - lastRead < 1000) return;
+  lastRead = millis();
+  uint32_t mv = 0;
+  for (int i = 0; i < 8; ++i) mv += analogReadMilliVolts(PIN_VBAT);
+  float volts = (mv / 8.0f) * 2.0f / 1000.0f;
+  batteryVoltage = batteryVoltage == 0.0f ? volts : batteryVoltage * 0.8f + volts * 0.2f;
+}
+
+int batteryPercent() {
+  return constrain((int)((batteryVoltage - 3.30f) / (4.20f - 3.30f) * 100.0f), 0, 100);
+}
+
+
+
+// --- LED: เขียว = ต่อหุ่นได้ (กะพริบ = กำลังนำทาง), แดง = ออฟไลน์ / STOP / แบตต่ำ ---
+
+void updateLeds() {
+  bool online = WiFi.status() == WL_CONNECTED && webSocketConnected;
+  bool fastBlink = (millis() / 150) % 2;
+  bool slowBlink = (millis() / 500) % 2;
+  bool green = navigationActive ? slowBlink : online;
+  bool red = !online || (millis() < stopFlashUntil && fastBlink) ||
+             (batteryVoltage > 0.5f && batteryVoltage < BATTERY_LOW_VOLTAGE && slowBlink);
+  digitalWrite(PIN_LED_GREEN, green ? HIGH : LOW);
+  digitalWrite(PIN_LED_RED, red ? HIGH : LOW);
+}
+
+
+
+// --- LCD 1602 ---
+
+void initLcd() {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  uint8_t address = 0;
+  for (uint8_t candidate : {0x27, 0x3F}) {
+    Wire.beginTransmission(candidate);
+    if (Wire.endTransmission() == 0) {
+      address = candidate;
+      break;
+    }
+  }
+  if (address == 0) {
+    Serial.println("[LCD] Not found at 0x27 / 0x3F");
+    return;
+  }
+  lcd = new LiquidCrystal_I2C(address, 16, 2);
+  lcd->init();
+  lcd->backlight();
+  Serial.printf("[LCD] Found at 0x%02X\n", address);
+}
+
+void lcdWriteLine(uint8_t row, String text) {
+  if (lcd == nullptr) return;
+  if (text.length() > 16) text = text.substring(0, 16);
+  while (text.length() < 16) text += ' ';
+  if (text == lcdLines[row]) return;  // เขียนเฉพาะเมื่อเปลี่ยน กันจอกระพริบ
+  lcdLines[row] = text;
+  lcd->setCursor(0, row);
+  lcd->print(text);
+}
+
+void showMessage(const String& text, unsigned long durationMs) {
+  lcdMessage = text;
+  lcdMessageUntil = millis() + durationMs;
+}
+
+void updateLcd() {
+  static unsigned long lastUpdate = 0;
+  if (lcd == nullptr || millis() - lastUpdate < 200) return;
+  lastUpdate = millis();
+
+  String top;
+  if (WiFi.status() != WL_CONNECTED) top = "WiFi connecting";
+  else if (!webSocketConnected) top = "Robot offline";
+  else if (navigationActive) top = "NAV " + currentTargetName +
+                                   (navigationQueue.empty() ? "" : " +" + String(navigationQueue.size()));
+  else if (controlMode == MODE_MANUAL) top = "MANUAL " + String(manualSpeed, 2) + "m/s";
+  else top = "READY  " + String(manualSpeed, 2) + "m/s";
+  lcdWriteLine(0, top);
+
+  String bottom;
+  if (millis() < lcdMessageUntil) bottom = lcdMessage;
+  else if (inputBuffer.length() > 0) bottom = "Go to: " + inputBuffer + "_";
+  else if (batteryVoltage > 0.5f) bottom = "Bat " + String(batteryVoltage, 2) + "V " + String(batteryPercent()) + "%";
+  else bottom = "";
+  lcdWriteLine(1, bottom);
+}
+
+
+
 void setup() {
 
   Serial.begin(9600);
+
+  // --- ฮาร์ดแวร์บนบอร์ด ---
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  digitalWrite(PIN_LED_RED, HIGH);         // แดงติดระหว่างบูต/ต่อ Wi-Fi
+  pinMode(PIN_JOY_SW, INPUT);              // GPIO39 ไม่มี pull-up ภายใน (มี R3 บนบอร์ด)
+  analogSetPinAttenuation(PIN_JOY_X, ADC_11db);
+  analogSetPinAttenuation(PIN_JOY_Y, ADC_11db);
+  analogSetPinAttenuation(PIN_VBAT, ADC_11db);
+  initLcd();
+  lcdWriteLine(0, "AutoXing Remote");
+  lcdWriteLine(1, "Starting...");
+  calibrateJoystick();                     // ต้องปล่อยคันโยกไว้ตรงกลางตอนเปิดเครื่อง
+  updateBattery();
 
 
 
@@ -519,6 +828,7 @@ void setup() {
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to Wi-Fi");
+  lcdWriteLine(1, "WiFi " + String(ssid));
 
   while (WiFi.status() != WL_CONNECTED) {
 
@@ -529,8 +839,9 @@ void setup() {
   }
 
   Serial.println("\nConnected to Wi-Fi!");
+  lcdWriteLine(1, "Loading map...");
 
-  loadPointTargetsFromRobot();
+  if (!loadPointTargetsFromRobot()) showMessage("Map load failed", 3000);
   setRemoteControlMode();
   robotWebSocket.begin(robot_ip, robot_port, "/ws/v2/topics");
   robotWebSocket.onEvent(onWebSocketEvent);
@@ -540,7 +851,8 @@ void setup() {
 
   // เริ่มต้นตัวรับ IR
 
-  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+  // ปิด LED feedback: LED_BUILTIN ของบาง board definition ตรงกับ IO13 (keypad C3)
+  IrReceiver.begin(IR_RECEIVE_PIN, DISABLE_LED_FEEDBACK);
 
   Serial.println("IR Receiver Ready. Waiting for signals...");
 
@@ -603,16 +915,7 @@ void loop() {
         // Refresh the held-key timer, but do not POST the control mode again.
         lastDirectionSignalTime = millis();
       }
-      if (isNavigationKey) {
-        // Number keys may append destinations while a move is running.
-        // They only stop manual mode; they never cancel active navigation.
-        if (!navigationActive && controlMode == MODE_MANUAL) sendRobotStopCommand();
-        if (!navigationActive && controlMode == MODE_NAVIGATION) {
-          setRobotControlMode("auto");
-          controlMode = MODE_IDLE;
-        }
-        lastDirectionCode = 0;
-      }
+      if (isNavigationKey) prepareForDigitEntry();
 
 
 
@@ -653,25 +956,25 @@ void loop() {
 
         // --- ปุ่มตัวเลข 0-9 ---
 
-        case CODE_0: inputBuffer += "0"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_0: appendDigit('0'); break;
 
-        case CODE_1: inputBuffer += "1"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_1: appendDigit('1'); break;
 
-        case CODE_2: inputBuffer += "2"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_2: appendDigit('2'); break;
 
-        case CODE_3: inputBuffer += "3"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_3: appendDigit('3'); break;
 
-        case CODE_4: inputBuffer += "4"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_4: appendDigit('4'); break;
 
-        case CODE_5: inputBuffer += "5"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_5: appendDigit('5'); break;
 
-        case CODE_6: inputBuffer += "6"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_6: appendDigit('6'); break;
 
-        case CODE_7: inputBuffer += "7"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_7: appendDigit('7'); break;
 
-        case CODE_8: inputBuffer += "8"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_8: appendDigit('8'); break;
 
-        case CODE_9: inputBuffer += "9"; Serial.println("Buffer: " + inputBuffer); break;
+        case CODE_9: appendDigit('9'); break;
 
         case CODE_INCREASE: changeManualSpeed(SPEED_STEP); break;
 
@@ -727,5 +1030,12 @@ void loop() {
   if (!navigationActive && !navigationQueue.empty()) {
     startNextQueuedMove();
   }
+
+  // ฮาร์ดแวร์บนบอร์ด: keypad, joystick, แบตเตอรี่, LED, จอ LCD
+  handleKeypad();
+  handleJoystick();
+  updateBattery();
+  updateLeds();
+  updateLcd();
 
 }
